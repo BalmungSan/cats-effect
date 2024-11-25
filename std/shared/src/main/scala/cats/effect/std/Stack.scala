@@ -18,7 +18,8 @@ package cats
 package effect
 package std
 
-import cats.effect.kernel.{Async, GenConcurrent, Sync}
+import cats.effect.kernel._
+import cats.syntax.all._
 
 /**
  * A purely functional, concurrent data structure which allows insertion and retrieval of
@@ -38,19 +39,19 @@ abstract class Stack[F[_], A] { self =>
   /**
    * Pushes the given element to the top of the `Stack`.
    *
-   * @param a
+   * @param element
    *   the element to push at the top of the `Stack`.
    */
-  def push(a: A): F[Unit]
+  def push(element: A): F[Unit]
 
   /**
    * Pushes the given elements to the top of the `Stack`, the last element will be the final
    * top.
    *
-   * @param as
+   * @param elements
    *   the elements to push at the top of the `Stack`.
    */
-  def pushN(as: A*): F[Unit]
+  def pushN(elements: A*): F[Unit]
 
   /**
    * Takes the top element of `Stack`, if there is none it will semantically block until one is
@@ -92,11 +93,11 @@ abstract class Stack[F[_], A] { self =>
    */
   final def mapK[G[_]](f: F ~> G): Stack[G, A] =
     new Stack[G, A] {
-      override def push(a: A): G[Unit] =
-        f(self.push(a))
+      override def push(element: A): G[Unit] =
+        f(self.push(element))
 
-      override def pushN(as: A*): G[Unit] =
-        f(self.pushN(as: _*))
+      override def pushN(elements: A*): G[Unit] =
+        f(self.pushN(elements: _*))
 
       override def pop: G[A] =
         f(self.pop)
@@ -117,12 +118,127 @@ object Stack {
   /**
    * Creates a new `Stack`.
    */
-  def apply[F[_], A](implicit F: GenConcurrent[F, _]): F[Stack[F, A]] =
-    ???
+  def apply[F[_], A](implicit F: Concurrent[F]): F[Stack[F, A]] =
+    // Initialize the state with an empty stack.
+    Ref.of[F, StackState[F, A]](StackState.empty).map(state => new ConcurrentImpl(state))
 
   /**
    * Creates a new `Stack`. Like `apply` but initializes state using another effect constructor.
    */
   def in[F[_], G[_], A](implicit F: Sync[F], G: Async[G]): F[Stack[G, A]] =
-    ???
+    // Initialize the state with an empty stack.
+    Ref.in[F, G, StackState[G, A]](StackState.empty).map(state => new ConcurrentImpl(state))
+
+  private final case class StackState[F[_], A](
+      elements: List[A],
+      waiters: collection.immutable.Queue[Deferred[F, A]]
+  ) {
+    type CopyResult = StackState[F, A]
+    type ModifyResult[R] = (CopyResult, R)
+
+    def push(element: A)(implicit F: Concurrent[F]): ModifyResult[F[Unit]] =
+      waiters.dequeueOption match {
+        case Some((waiter, remainingWaiters)) =>
+          this.copy(waiters = remainingWaiters) -> waiter.complete(element).void
+
+        case None =>
+          this.copy(elements = element :: this.elements) -> F.unit
+      }
+
+    def pushN(elements: Seq[A])(implicit F: Concurrent[F]): ModifyResult[F[Unit]] =
+      if (this.waiters.isEmpty)
+        // If there are no waiters we just push all the elements in reverse order.
+        this.copy(elements = this.elements.prependedAll(elements.reverseIterator)) -> F.unit
+      else {
+        // Otherwise, if there is at least one waiter, we take all we can.
+        val (remaining, waitersToNotify) =
+          elements.reverse.align(this.waiters).partitionMap(_.unwrap)
+
+        // We notify all the waiters we could take.
+        val notifyWaiters = waitersToNotify.traverse_ {
+          case (element, waiter) =>
+            waiter.complete(element).void
+        }
+
+        // The remaining elements are either all elements, or all waiters.
+        val newState = remaining.parTraverse(_.toEitherNec) match {
+          case Left(remainingElements) =>
+            // If only elements remained, then we preserve all the pending waiters,
+            // and set the Stack elements as the remaining ones.
+            // This is safe because the remaining elements are already in the correct order,
+            // and since there was at least one waiter then we can assume there were not pending elements.
+            this.copy(elements = remainingElements.toList)
+
+          case Right(remainingWaiters) =>
+            // If only waiters remained, then we create a new Queue from them.
+            this.copy(waiters = collection.immutable.Queue.from(remainingWaiters))
+        }
+
+        newState -> notifyWaiters
+      }
+
+    def pop(
+        waiter: Deferred[F, A],
+        poll: Poll[F]
+    )(
+        implicit F: Concurrent[F]
+    ): ModifyResult[F[A]] =
+      elements match {
+        case head :: tail =>
+          this.copy(elements = tail) -> F.pure(head)
+
+        case Nil =>
+          this.copy(waiters = waiters.enqueue(waiter)) -> poll(waiter.get)
+      }
+
+    def removeWaiter(waiter: Deferred[F, A]): CopyResult =
+      this.copy(waiters = this.waiters.filterNot(_ eq waiter))
+
+    def tryPop: ModifyResult[Option[A]] =
+      elements match {
+        case head :: tail =>
+          this.copy(elements = tail) -> Some(head)
+
+        case Nil =>
+          this -> None
+      }
+  }
+
+  private object StackState {
+    def empty[F[_], A]: StackState[F, A] = StackState(
+      elements = List.empty,
+      waiters = collection.immutable.Queue.empty
+    )
+  }
+
+  private final class ConcurrentImpl[F[_], A](
+      state: Ref[F, StackState[F, A]]
+  )(
+      implicit F: Concurrent[F]
+  ) extends Stack[F, A] {
+    override def push(element: A): F[Unit] =
+      F.uncancelable(_ => state.flatModify(_.push(element)))
+
+    override def pushN(elements: A*): F[Unit] =
+      F.uncancelable(_ => state.flatModify(_.pushN(elements)))
+
+    override final val pop: F[A] =
+      F.uncancelable { poll =>
+        for {
+          waiter <- Deferred[F, A]
+          wait <- state.modify(_.pop(waiter, poll))
+          waitCancelledFinalizer = state.update(_.removeWaiter(waiter))
+          result <- F.onCancel(wait, waitCancelledFinalizer)
+        } yield result
+      }
+
+    override final val tryPop: F[Option[A]] =
+      F.uncancelable(_ => state.modify(_.tryPop))
+
+    override final val peek: F[Option[A]] =
+      state.get.map(_.elements.headOption)
+
+    override final val size: F[Int] =
+      state.get.map(_.elements.size)
+  }
 }
