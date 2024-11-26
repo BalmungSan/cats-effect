@@ -242,7 +242,7 @@ object Stack {
           // Otherwise try to push all the elements at once.
           state.flatModify(_.pushN(elements)).flatMap { failedElements =>
             // For the elements we failed to push, we retry.
-            this.pushN(failedElements: _*)
+            this.pushN(failedElements.reverse: _*)
           }
       }
 
