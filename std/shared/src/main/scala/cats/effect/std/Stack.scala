@@ -145,19 +145,26 @@ object Stack {
           this.copy(elements = element :: this.elements) -> F.pure(true)
       }
 
-    def pushN(elements: Seq[A])(implicit F: Concurrent[F]): ModifyResult[F[Unit]] =
+    def pushN(elements: Seq[A])(implicit F: Concurrent[F]): ModifyResult[F[Seq[A]]] =
       if (this.waiters.isEmpty)
         // If there are no waiters we just push all the elements in reverse order.
-        this.copy(elements = this.elements.prependedAll(elements.reverseIterator)) -> F.unit
+        this.copy(
+          elements = this.elements.prependedAll(elements.reverseIterator)
+        ) -> F.pure(Seq.empty)
       else {
         // Otherwise, if there is at least one waiter, we take all we can.
         val (remaining, waitersToNotify) =
           elements.reverse.align(this.waiters).partitionMap(_.unwrap)
 
-        // We notify all the waiters we could take.
-        val notifyWaiters = waitersToNotify.traverse_ {
+        // We try to notify all the waiters we could take.
+        val notifyWaiters = waitersToNotify.traverseFilter {
           case (element, waiter) =>
-            waiter.complete(element).void
+            waiter.complete(element).map {
+              // If the waiter was successfully awaken, we remove the element from the Stack.
+              case true => None
+              // Otherwise, we preserve the element for retrying the push.
+              case false => Some(element)
+            }
         }
 
         // The remaining elements are either all elements, or all waiters.
@@ -226,7 +233,18 @@ object Stack {
       }
 
     override def pushN(elements: A*): F[Unit] =
-      F.uncancelable(_ => state.flatModify(_.pushN(elements)))
+      F.uncancelable { _ =>
+        // If elements is empty, do nothing.
+        if (elements.isEmpty) F.unit
+        // Optimize for the singleton case.
+        else if (elements.sizeIs == 1) this.push(elements.head)
+        else
+          // Otherwise try to push all the elements at once.
+          state.flatModify(_.pushN(elements)).flatMap { failedElements =>
+            // For the elements we failed to push, we retry.
+            this.pushN(failedElements: _*)
+          }
+      }
 
     override final val pop: F[A] =
       F.uncancelable { poll =>
