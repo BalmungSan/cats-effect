@@ -136,13 +136,13 @@ object Stack {
     type CopyResult = StackState[F, A]
     type ModifyResult[R] = (CopyResult, R)
 
-    def push(element: A)(implicit F: Concurrent[F]): ModifyResult[F[Unit]] =
+    def push(element: A)(implicit F: Concurrent[F]): ModifyResult[F[Boolean]] =
       waiters.dequeueOption match {
         case Some((waiter, remainingWaiters)) =>
-          this.copy(waiters = remainingWaiters) -> waiter.complete(element).void
+          this.copy(waiters = remainingWaiters) -> waiter.complete(element)
 
         case None =>
-          this.copy(elements = element :: this.elements) -> F.unit
+          this.copy(elements = element :: this.elements) -> F.pure(true)
       }
 
     def pushN(elements: Seq[A])(implicit F: Concurrent[F]): ModifyResult[F[Unit]] =
@@ -177,18 +177,13 @@ object Stack {
         newState -> notifyWaiters
       }
 
-    def pop(
-        waiter: Deferred[F, A],
-        poll: Poll[F]
-    )(
-        implicit F: Concurrent[F]
-    ): ModifyResult[F[A]] =
+    def pop(waiter: Deferred[F, A]): ModifyResult[Option[A]] =
       elements match {
         case head :: tail =>
-          this.copy(elements = tail) -> F.pure(head)
+          this.copy(elements = tail) -> Some(head)
 
         case Nil =>
-          this.copy(waiters = waiters.enqueue(waiter)) -> poll(waiter.get)
+          this.copy(waiters = waiters.enqueue(waiter)) -> None
       }
 
     def removeWaiter(waiter: Deferred[F, A]): CopyResult =
@@ -217,19 +212,53 @@ object Stack {
       implicit F: Concurrent[F]
   ) extends Stack[F, A] {
     override def push(element: A): F[Unit] =
-      F.uncancelable(_ => state.flatModify(_.push(element)))
+      F.uncancelable { _ =>
+        // Try to push an element to the Stack.
+        state.flatModify(_.push(element)).flatMap {
+          case true =>
+            // If it worked we finish the process.
+            F.unit
+
+          case false =>
+            // If it failed, we retry.
+            this.push(element)
+        }
+      }
 
     override def pushN(elements: A*): F[Unit] =
       F.uncancelable(_ => state.flatModify(_.pushN(elements)))
 
     override final val pop: F[A] =
       F.uncancelable { poll =>
-        for {
-          waiter <- Deferred[F, A]
-          wait <- state.modify(_.pop(waiter, poll))
-          waitCancelledFinalizer = state.update(_.removeWaiter(waiter))
-          result <- F.onCancel(wait, waitCancelledFinalizer)
-        } yield result
+        Deferred[F, A].flatMap { waiter =>
+          // Try to pop the head of the Stack.
+          state.modify(_.pop(waiter)).flatMap {
+            case Some(head) =>
+              // If there is one, we simply return it.
+              F.pure(head)
+
+            case None =>
+              // If there wasn't one,
+              // we already added our waiter at the end of the waiters queue.
+              // We then need to wait for it to be completed.
+              // However, we may be cancelled while waiting for that.
+              // If we are cancelled, then we will try to invalidate our waiter:
+              val waitCancelledFinalizer = waiter.complete(null.asInstanceOf[A]).flatMap {
+                case true =>
+                  // If we managed to invalidate our waiter,
+                  // we try to remove it from the waiters queue.
+                  state.update(_.removeWaiter(waiter)).void
+
+                case false =>
+                  // But, if we didn't managed to invalidate it.
+                  // Then, that means we managed to receive a pushed element.
+                  // Thus, we have to push it again to avoid it getting lost.
+                  waiter.get.flatMap(element => this.push(element))
+              }
+
+              F.onCancel(poll(waiter.get), waitCancelledFinalizer)
+          }
+        }
       }
 
     override final val tryPop: F[Option[A]] =
