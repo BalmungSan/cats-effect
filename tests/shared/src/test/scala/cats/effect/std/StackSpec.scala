@@ -208,7 +208,7 @@ final class StackSpec extends BaseSpec with DetectPlatform {
 
     "not lost elements when concurrently canceling a pop with a push" in ticked {
       implicit timer =>
-        val p = (stack, IO.deferred[Either[Int, Option[Int]]]).flatMapN {
+        val task = (stack, IO.deferred[Either[Int, Option[Int]]]).flatMapN {
           case (s, df) =>
             val left =
               IO.uncancelable(poll => poll(s.pop).flatMap(n => df.complete(Left(n)))).void
@@ -223,13 +223,36 @@ final class StackSpec extends BaseSpec with DetectPlatform {
             } >> right >> df.get
         }
 
-        List.fill(if (isJVM) 1000 else 5)(p).forallM { result =>
+        val p = List.fill(if (isJVM) 1000 else 5)(task).forallM { result =>
           result.map {
             case Left(1) => true
             case Right(Some(1)) => true
             case _ => false
           }
-        } must completeAs(true)
+        }
+
+        p must completeAs(true)
+    }
+
+    "not lost elements when concurrently canceling multiple pops with a pushN" in ticked {
+      implicit timer =>
+        val numbers = List.range(start = 0, end = 10)
+
+        val task = for {
+          s <- stack
+          fibers <- s.pop.option.start.replicateA(5)
+          _ <- (
+            IO.sleep(10.millis) >> fibers.parTraverse_(_.cancel),
+            IO.sleep(10.millis) >> s.pushN(numbers: _*)
+          ).parTupled
+          popedElements <- fibers.traverseFilter(_.joinWith(IO.none))
+          remainingElements <- s.pop.replicateA(numbers.size - popedElements.size)
+        } yield (popedElements ++ remainingElements).sorted
+
+        val p =
+          List.fill(if (isJVM) 1000 else 5)(task).forallM(result => result.map(_ == numbers))
+
+        p must completeAs(true)
     }
   }
 }
