@@ -580,6 +580,25 @@ sealed abstract class IO[+A] private () extends IOPlatform[A] {
   def map[B](f: A => B): IO[B] = IO.Map(this, f, Tracing.calculateTracingEvent(f))
 
   /**
+   * Like [[map]], but inserts a [[IO#cede]] before and after `f`. Use this when `f` is a
+   * long-running, compute-bound operation.
+   *
+   * @see
+   *   [[IO#cede]] for more details
+   */
+  def computeMap[B](f: A => B): IO[B] =
+    IO.cede >> map(f).guarantee(IO.cede)
+
+  /**
+   * Like [[computeMap]], but allows raising errors in an Either.
+   *
+   * @see
+   *   [[computeMap]] for more details
+   */
+  def computeMapAttempt[B](f: A => Either[Throwable, B]): IO[B] =
+    IO.cede >> flatMap(a => IO.fromEither(f(a))).guarantee(IO.cede)
+
+  /**
    * Applies rate limiting to this `IO` based on provided backpressure semantics.
    *
    * @return
