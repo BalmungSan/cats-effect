@@ -2119,6 +2119,12 @@ object IO extends IOCompanionPlatform with IOLowPriorityImplicits with TuplePara
     def flatMap[A, B](fa: IO[A])(f: A => IO[B]): IO[B] =
       fa.flatMap(f)
 
+    override def computeMap[A, B](fa: IO[A])(f: A => B): IO[B] =
+      fa.computeMap(f)
+
+    override def computeMapAttempt[A, B](fa: IO[A])(f: A => Either[Throwable, B]): IO[B] =
+      fa.computeMapAttempt(f)
+
     override def delay[A](thunk: => A): IO[A] = IO(thunk)
 
     /**
