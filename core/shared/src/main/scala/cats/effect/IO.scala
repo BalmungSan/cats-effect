@@ -1305,6 +1305,27 @@ object IO extends IOCompanionPlatform with IOLowPriorityImplicits with TuplePara
   }
 
   /**
+   * Suspends a long-running, compute-bound operation. Like [[delay]], but inserts a [[cede]]
+   * before and after computing the result.
+   *
+   * @see
+   *   [[cede]] for more details
+   * @see
+   *   [[delay]] for more details
+   */
+  def compute[A](thunk: => A): IO[A] =
+    IO.cede >> IO.delay(thunk).guarantee(IO.cede)
+
+  /**
+   * Like [[compute]], but allows raising errors in an Either.
+   *
+   * @see
+   *   [[compute]] for more details
+   */
+  def computeAttempt[A](thunk: => Either[Throwable, A]): IO[A] =
+    IO.cede >> delay(thunk).rethrow.guarantee(IO.cede)
+
+  /**
    * Suspends a synchronous side effect which produces an `IO` in `IO`.
    *
    * This is useful for trampolining (i.e. when the side effect is conceptually the allocation
