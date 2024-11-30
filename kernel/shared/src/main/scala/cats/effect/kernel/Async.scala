@@ -19,7 +19,8 @@ package cats.effect.kernel
 import cats.{~>, Monoid, Semigroup}
 import cats.arrow.FunctionK
 import cats.data.{EitherT, Ior, IorT, Kleisli, OptionT, WriterT}
-import cats.implicits._
+import cats.effect.kernel.syntax.monadCancel._
+import cats.syntax.all._
 
 import scala.annotation.{nowarn, tailrec}
 import scala.concurrent.{ExecutionContext, Future}
@@ -60,6 +61,7 @@ import java.util.concurrent.atomic.AtomicReference
  * running {{{async(k)}}} is canceled.
  */
 trait Async[F[_]] extends AsyncPlatform[F] with Sync[F] with Temporal[F] {
+  implicit private[this] def F: MonadCancel[F, Throwable] = this
 
   /**
    * Suspends an asynchronous side effect with optional immediate result in `F`.
@@ -156,6 +158,27 @@ trait Async[F[_]] extends AsyncPlatform[F] with Sync[F] with Temporal[F] {
    */
   def async_[A](k: (Either[Throwable, A] => Unit) => Unit): F[A] =
     async[A](cb => as(delay(k(cb)), None))
+
+  /**
+   * Suspends a long-running, compute-bound operation. Like [[delay]], but inserts a [[cede]]
+   * before and after computing the result.
+   *
+   * @see
+   *   [[cede]] for more details
+   * @see
+   *   [[delay]] for more details
+   */
+  def compute[A](thunk: => A): F[A] =
+    cede >> delay(thunk).guarantee(cede)
+
+  /**
+   * Like [[compute]], but allows raising errors in an Either.
+   *
+   * @see
+   *   [[compute]] for more details
+   */
+  def computeAttempt[A](thunk: => Either[Throwable, A]): F[A] =
+    cede >> delay(thunk).rethrow.guarantee(cede)
 
   /**
    * An effect that never terminates.
