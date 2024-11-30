@@ -2146,7 +2146,14 @@ object IO extends IOCompanionPlatform with IOLowPriorityImplicits with TuplePara
     override def computeMapAttempt[A, B](fa: IO[A])(f: A => Either[Throwable, B]): IO[B] =
       fa.computeMapAttempt(f)
 
-    override def delay[A](thunk: => A): IO[A] = IO(thunk)
+    override def delay[A](thunk: => A): IO[A] =
+      IO.delay(thunk)
+
+    override def compute[A](thunk: => A): IO[A] =
+      IO.compute(thunk)
+
+    override def computeAttempt[A](thunk: => Either[Throwable, A]): IO[A] =
+      IO.computeAttempt(thunk)
 
     /**
      * Like [[IO.delay]] but intended for thread blocking operations. `blocking` will shift the
