@@ -587,7 +587,7 @@ sealed abstract class IO[+A] private () extends IOPlatform[A] {
    *   [[IO#cede]] for more details
    */
   def computeMap[B](f: A => B): IO[B] =
-    IO.cede >> map(f).guarantee(IO.cede)
+    this.flatMap(a => IO.compute(f(a)))
 
   /**
    * Like [[computeMap]], but allows raising errors in an Either.
@@ -596,7 +596,7 @@ sealed abstract class IO[+A] private () extends IOPlatform[A] {
    *   [[computeMap]] for more details
    */
   def computeMapAttempt[B](f: A => Either[Throwable, B]): IO[B] =
-    IO.cede >> flatMap(a => IO.fromEither(f(a))).guarantee(IO.cede)
+    this.flatMap(a => IO.computeAttempt(f(a)))
 
   /**
    * Applies rate limiting to this `IO` based on provided backpressure semantics.
@@ -1323,7 +1323,7 @@ object IO extends IOCompanionPlatform with IOLowPriorityImplicits with TuplePara
    *   [[compute]] for more details
    */
   def computeAttempt[A](thunk: => Either[Throwable, A]): IO[A] =
-    IO.cede >> delay(thunk).rethrow.guarantee(IO.cede)
+    IO.cede >> IO.delay(thunk).rethrow.guarantee(IO.cede)
 
   /**
    * Suspends a synchronous side effect which produces an `IO` in `IO`.
